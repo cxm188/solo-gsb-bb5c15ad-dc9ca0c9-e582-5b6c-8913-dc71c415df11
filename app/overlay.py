@@ -66,11 +66,15 @@ class OverlayDecision:
     blocker: TreeNode | None = None  # 仅冲突/阻挡类 BLOCKED 时有值
 
 
-def validate_existing_entries(entries: list[NormalizedEntry]) -> None:
-    """校验现存清单；发现问题时抛出 ``ValueError``（API 层映射为 422）。
+def validate_existing_entries(
+    entries: list[NormalizedEntry], label: str = "现存清单"
+) -> None:
+    """校验清单；发现问题时抛出 ``ValueError``（API 层映射为 422）。
 
     依次检查：不安全路径 → 同键重复 → 文件占据其他条目的祖先路径。
-    调用方保证 ``entries`` 的下标与现存清单一一对应（从 1 开始）。
+    调用方保证 ``entries`` 的下标与清单一一对应（从 1 开始）。
+
+    ``label`` 仅用于错误信息中标注清单名称（如现存清单、期望清单）。
     """
     for entry in entries:
         if entry.unsafe:
@@ -78,7 +82,7 @@ def validate_existing_entries(entries: list[NormalizedEntry]) -> None:
                 i.code.value for i in entry.issues if i.severity == IssueSeverity.ERROR
             )
             raise ValueError(
-                f"现存清单条目 #{entry.index}（{entry.original_path!r}）"
+                f"{label}条目 #{entry.index}（{entry.original_path!r}）"
                 f"路径不安全：{codes}"
             )
 
@@ -87,7 +91,7 @@ def validate_existing_entries(entries: list[NormalizedEntry]) -> None:
         key = entry.comparison_key
         if key in seen:
             raise ValueError(
-                f"现存清单条目 #{seen[key]} 与 #{entry.index} 规范化后同键重复"
+                f"{label}条目 #{seen[key]} 与 #{entry.index} 规范化后同键重复"
                 f"（{entry.canonical_path}）"
             )
         seen[key] = entry.index
@@ -98,7 +102,7 @@ def validate_existing_entries(entries: list[NormalizedEntry]) -> None:
             ancestor = files.get("/".join(entry.key_parts[:depth]))
             if ancestor is not None:
                 raise ValueError(
-                    f"现存清单文件条目 #{ancestor.index}（{ancestor.canonical_path}）"
+                    f"{label}文件条目 #{ancestor.index}（{ancestor.canonical_path}）"
                     f"占据了条目 #{entry.index}（{entry.canonical_path}）的祖先路径"
                 )
 
@@ -120,19 +124,31 @@ def _ensure_implicit_ancestors(
         )
 
 
-def build_existing_tree(entries: list[NormalizedEntry]) -> dict[str, TreeNode]:
-    """把（已通过 :func:`validate_existing_entries` 校验的）现存清单插入虚拟目录树。"""
+def build_manifest_tree(
+    entries: list[NormalizedEntry], source: OverlayNodeSource
+) -> dict[str, TreeNode]:
+    """把（已通过 :func:`validate_existing_entries` 校验的）清单插入虚拟目录树。
+
+    未显式列出的父目录按隐含目录（:attr:`OverlayNodeSource.IMPLICIT`）补齐；
+    显式条目的来源为调用方给定的 ``source``，并覆盖由其他条目推导出的同名
+    隐含目录。
+    """
     tree: dict[str, TreeNode] = {}
     for entry in entries:
         _ensure_implicit_ancestors(tree, entry)
         # 显式条目覆盖可能先由其他条目推导出的同名隐含目录。
         tree[entry.comparison_key] = TreeNode(
             entry.entry_type,
-            OverlayNodeSource.EXISTING,
+            source,
             entry.index,
             entry.canonical_path,
         )
     return tree
+
+
+def build_existing_tree(entries: list[NormalizedEntry]) -> dict[str, TreeNode]:
+    """把现存清单（已通过 :func:`validate_existing_entries` 校验）插入虚拟目录树。"""
+    return build_manifest_tree(entries, OverlayNodeSource.EXISTING)
 
 
 def apply_entry(tree: dict[str, TreeNode], entry: NormalizedEntry) -> OverlayDecision:

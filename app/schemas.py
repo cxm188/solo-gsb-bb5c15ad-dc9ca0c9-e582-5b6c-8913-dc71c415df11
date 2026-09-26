@@ -7,6 +7,7 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 
 from .normalize import IssueCode, IssueSeverity, normalize_entry
+from .mirror import MirrorOperation
 from .overlay import (
     OverlayBlockReason,
     OverlayNodeSource,
@@ -475,6 +476,89 @@ class OverlayPreviewResponse(BaseModel):
     target: str = "windows"
     entries: list[OverlayEntryOut]
     summary: OverlaySummary
+
+
+class MirrorPreviewRequest(BaseModel):
+    """目录镜像同步预演请求：现存清单 + 期望归档清单（纯内存生成操作序列）。"""
+
+    existing: list[OverlayEntryIn] = Field(
+        default_factory=list,
+        description=(
+            "目标目录现存的 file/directory 清单（可为空，表示空目录）；"
+            "沿用 overlay-preview 的现存清单校验，含不安全路径、同键重复或"
+            "文件祖先冲突时返回 422"
+        ),
+    )
+    incoming: list[OverlayEntryIn] = Field(
+        default_factory=list,
+        description=(
+            "期望归档的 file/directory 清单（可为空，表示清空目标目录）；"
+            "含不安全路径、同键（Windows 比较键）重复或文件占据其他条目"
+            "祖先路径时返回 422。未列出的父目录视为需要保留的隐含目录"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_manifests(self) -> "MirrorPreviewRequest":
+        existing = [
+            normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+            for i, e in enumerate(self.existing, start=1)
+        ]
+        validate_existing_entries(existing, label="现存清单")
+        incoming = [
+            normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+            for i, e in enumerate(self.incoming, start=1)
+        ]
+        validate_existing_entries(incoming, label="期望清单")
+        return self
+
+
+class MirrorStepOut(BaseModel):
+    order: int = Field(..., description="执行顺序（从 1 开始）")
+    operation: MirrorOperation = Field(
+        ...,
+        description=(
+            "操作类型：DELETE（删除期望布局外或类型互换处的旧节点）、"
+            "KEEP_DIRECTORY（保留现存目录）、CREATE_DIRECTORY（新建目录）、"
+            "OVERWRITE_FILE（覆盖同键文件）、CREATE_FILE（新建文件）"
+        ),
+    )
+    node_type: OverlayEntryType = Field(
+        ..., description="节点类型：file 或 directory"
+    )
+    source: OverlayNodeSource = Field(
+        ...,
+        description=(
+            "操作节点来源：existing（现存清单显式条目）、incoming（期望清单"
+            "条目）或 implicit（未显式列出的隐含目录）"
+        ),
+    )
+    index: int | None = Field(
+        ...,
+        description=(
+            "原清单下标（从 1 开始）：DELETE/KEEP_DIRECTORY 指向 existing，"
+            "CREATE_*/OVERWRITE_FILE 指向 incoming；隐含目录为 null"
+        ),
+    )
+    canonical_path: str = Field(..., description="规范路径（正斜杠分隔）")
+    comparison_key: str = Field(
+        ..., description="Windows 等价比较键（小写折叠）"
+    )
+
+
+class MirrorSummary(BaseModel):
+    total: int
+    delete: int
+    keep_directory: int
+    create_directory: int
+    create_file: int
+    overwrite_file: int
+
+
+class MirrorPreviewResponse(BaseModel):
+    target: str = "windows"
+    steps: list[MirrorStepOut]
+    summary: MirrorSummary
 
 
 class HealthResponse(BaseModel):

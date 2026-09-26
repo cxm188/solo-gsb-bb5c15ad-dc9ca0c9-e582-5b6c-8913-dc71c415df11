@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
-from .overlay import OverlayStatus, apply_entry, build_existing_tree
+from .mirror import MirrorOperation, plan_mirror
+from .overlay import (
+    OverlayNodeSource,
+    OverlayStatus,
+    apply_entry,
+    build_existing_tree,
+    build_manifest_tree,
+)
 from .repair import build_repair_plan
 from .resource import DeclaredSizes, check_resource_budgets
 from .schemas import (
@@ -11,6 +18,10 @@ from .schemas import (
     CollisionMember,
     EntryType,
     HierarchyConflict,
+    MirrorPreviewRequest,
+    MirrorPreviewResponse,
+    MirrorStepOut,
+    MirrorSummary,
     OverlayBlocker,
     OverlayEntryOut,
     OverlayEntryType,
@@ -365,4 +376,60 @@ def run_overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewRespons
     )
     return OverlayPreviewResponse(
         target="windows", entries=entries_out, summary=summary
+    )
+
+
+def run_mirror_preview(request: MirrorPreviewRequest) -> MirrorPreviewResponse:
+    """目录镜像同步预演：生成把现存布局同步为期望布局的操作序列（纯内存）。
+
+    两侧清单已在请求模型校验阶段通过
+    :func:`app.overlay.validate_existing_entries` 检查（否则请求以 422
+    被拒绝），此处直接构建两棵虚拟目录树并交给
+    :func:`app.mirror.plan_mirror` 排定操作。
+    """
+    existing = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.existing, start=1)
+    ]
+    incoming = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.incoming, start=1)
+    ]
+
+    existing_tree = build_existing_tree(existing)
+    desired_tree = build_manifest_tree(incoming, OverlayNodeSource.INCOMING)
+    incoming_files = [
+        (entry.index, entry.canonical_path, entry.comparison_key)
+        for entry in incoming
+        if entry.entry_type == "file"
+    ]
+
+    planned = plan_mirror(existing_tree, desired_tree, incoming_files)
+
+    steps_out = [
+        MirrorStepOut(
+            order=step.order,
+            operation=step.operation,
+            node_type=OverlayEntryType(step.node_type),
+            source=step.source,
+            index=step.index,
+            canonical_path=step.canonical_path,
+            comparison_key=step.comparison_key,
+        )
+        for step in planned
+    ]
+
+    counts = {op: 0 for op in MirrorOperation}
+    for step in planned:
+        counts[step.operation] += 1
+    summary = MirrorSummary(
+        total=len(steps_out),
+        delete=counts[MirrorOperation.DELETE],
+        keep_directory=counts[MirrorOperation.KEEP_DIRECTORY],
+        create_directory=counts[MirrorOperation.CREATE_DIRECTORY],
+        create_file=counts[MirrorOperation.CREATE_FILE],
+        overwrite_file=counts[MirrorOperation.OVERWRITE_FILE],
+    )
+    return MirrorPreviewResponse(
+        target="windows", steps=steps_out, summary=summary
     )

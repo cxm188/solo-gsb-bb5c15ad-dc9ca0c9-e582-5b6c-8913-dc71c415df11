@@ -9,9 +9,15 @@
 （单文件解压大小、整批解压总量、最大压缩比）；可选的 `selection_rules` 可在
 预检前按规范化后的归档路径 glob **筛选实际解包条目**（include/exclude）；
 另有**目标目录覆盖预演**接口：给定目标目录现存清单与按顺序解包的清单，
-在内存中的虚拟目录树上逐条干跑，预判每个条目将是新建、覆盖、目录复用还是被阻挡。
+在内存中的虚拟目录树上逐条干跑，预判每个条目将是新建、覆盖、目录复用还是被阻挡；
+以及**目录镜像同步预演**接口：给定现存布局与期望归档布局，只在内存中生成
+把现存布局同步为期望布局的完整操作序列（删除多余/类型互换节点、建目录、写文件）。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
+
+> 所有 HTTP 接口（含下文 curl 示例）均通过 **8000** 端口访问：
+> 本地或 Docker Compose 启动后地址为 `http://localhost:8000`，
+> Swagger 文档在 `http://localhost:8000/docs`。
 
 ## 一键启动（Docker Compose，端口 8000）
 
@@ -173,6 +179,86 @@ curl -s http://localhost:8000/api/v1/overlay-preview \
   -H 'Content-Type: application/json' \
   -d '{"existing":[{"path":"docs/readme.txt","type":"file"}],"incoming":[{"path":"docs/readme.txt","type":"file"},{"path":"docs","type":"file"}]}'
 ```
+
+### `POST /api/v1/mirror-preview`
+
+目录镜像同步预演：给定目标目录**现存清单**（`existing`）与**期望归档清单**
+（`incoming`），只在内存中生成把现存布局**同步为期望布局**的有序操作序列。
+全程纯内存词法计算，不访问文件系统。两侧均为 `file` / `directory` 清单
+（可同时为空；`incoming` 为空表示清空目标目录）。
+
+- **路径规范化**：两侧路径均复用与预检接口相同的 Windows 规范化规则
+  （分隔符统一、NFC、段尾裁剪、保留名/非法字符检查、词法遍历），
+  比较键为 `casefold` 折叠后的规范路径。
+- **清单校验（422）**：`existing` 沿用 overlay-preview 的现存清单校验
+  （不安全路径、同键重复、文件占据其他条目祖先路径）；`incoming` 采用
+  相同三条校验（错误信息中标注为“期望清单”）。任一项命中整个请求返回 422。
+- **隐含目录**：清单未显式列出的父目录视为需要保留的隐含目录
+  （它们在目标目录里必然存在）。期望布局即 `incoming` 全部显式节点加其
+  隐含父目录。
+
+操作分三个阶段生成，`steps` 即按执行顺序排列：
+
+1. **删除（DELETE，深 → 浅）**：删除现存布局中位于期望布局之外的节点
+   （多余文件/目录，含多余的隐含目录），以及同键但**类型互换**
+   （file ↔ directory）处的旧节点；按路径深度从深到浅、同深度按比较键排序，
+   保证先删子节点后删父节点。
+2. **建目录（浅 → 深）**：期望布局所需的目录，现存树中仍是同键目录的标记
+   `KEEP_DIRECTORY`（含现存隐含目录），否则标记 `CREATE_DIRECTORY`
+   （含期望清单未显式列出的隐含父目录）；按深度从浅到深、同深度按比较键排序。
+3. **写文件（按 incoming 顺序）**：严格按 `incoming` 输入顺序处理文件条目：
+   同键文件已存在标记 `OVERWRITE_FILE`，否则标记 `CREATE_FILE`。类型互换处
+   的旧文件已在阶段 1 删除，故此处不会再遇到类型冲突。
+
+请求体示例：
+
+```json
+{
+  "existing": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "docs/old/note.txt", "type": "file" },
+    { "path": "tmp", "type": "directory" },
+    { "path": "data.bin", "type": "file" },
+    { "path": "swap", "type": "directory" }
+  ],
+  "incoming": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "docs/new.md", "type": "file" },
+    { "path": "assets", "type": "directory" },
+    { "path": "assets/logo.png", "type": "file" },
+    { "path": "data.bin", "type": "directory" },
+    { "path": "data.bin/x", "type": "file" },
+    { "path": "swap", "type": "file" }
+  ]
+}
+```
+
+响应中每个步骤的字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `order` | 执行顺序（从 1 开始） |
+| `operation` | `DELETE` / `KEEP_DIRECTORY` / `CREATE_DIRECTORY` / `OVERWRITE_FILE` / `CREATE_FILE` |
+| `node_type` | 节点类型：`file` 或 `directory` |
+| `source` | 节点来源：`existing`（现存清单显式条目）、`incoming`（期望清单条目）或 `implicit`（隐含目录） |
+| `index` | 原清单下标（从 1 开始）：`DELETE` / `KEEP_DIRECTORY` 指向 `existing`，`CREATE_DIRECTORY` / `CREATE_FILE` / `OVERWRITE_FILE` 指向 `incoming`；隐含目录为 `null` |
+| `canonical_path` | 规范路径（正斜杠分隔、NFC、段尾已裁剪） |
+| `comparison_key` | Windows 等价比较键（`casefold` 折叠） |
+
+`summary` 给出 `total / delete / keep_directory / create_directory /
+create_file / overwrite_file` 各操作计数。
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/mirror-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"existing":[{"path":"docs/readme.txt","type":"file"},{"path":"junk.tmp","type":"file"}],"incoming":[{"path":"docs/readme.txt","type":"file"},{"path":"docs/new.md","type":"file"}]}'
+```
+
+上例返回的操作序列（节选）：先深 → 浅删除多余的 `junk.tmp`，再保留隐含
+目录 `docs`，最后按 incoming 顺序覆盖 `docs/readme.txt`、新建
+`docs/new.md`。
 
 ## 规范化规则（Windows 目标）
 
@@ -464,14 +550,15 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析与覆盖预演编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演与镜像同步预演编排
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
-│   ├── overlay.py       # 目标目录覆盖预演：现存清单校验、虚拟目录树与按序干跑（纯函数）
+│   ├── overlay.py       # 目标目录覆盖预演：清单校验、虚拟目录树与按序干跑（纯函数）
+│   ├── mirror.py        # 目录镜像同步预演：三阶段操作序列（删除→建目录→写文件，纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务
