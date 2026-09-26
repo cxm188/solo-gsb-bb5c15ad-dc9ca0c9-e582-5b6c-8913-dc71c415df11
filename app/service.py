@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
+from .mirror import MirrorAction, plan_mirror_operations
 from .overlay import OverlayStatus, apply_entry, build_existing_tree
 from .repair import build_repair_plan
 from .resource import DeclaredSizes, check_resource_budgets
@@ -11,6 +12,10 @@ from .schemas import (
     CollisionMember,
     EntryType,
     HierarchyConflict,
+    MirrorOperationOut,
+    MirrorPreviewRequest,
+    MirrorPreviewResponse,
+    MirrorSummary,
     OverlayBlocker,
     OverlayEntryOut,
     OverlayEntryType,
@@ -365,4 +370,49 @@ def run_overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewRespons
     )
     return OverlayPreviewResponse(
         target="windows", entries=entries_out, summary=summary
+    )
+
+
+def run_mirror_preview(request: MirrorPreviewRequest) -> MirrorPreviewResponse:
+    """镜像同步预演：规划把现存布局同步为期望布局的操作序列（纯内存）。
+
+    两侧清单已在请求模型校验阶段通过
+    :func:`app.overlay.validate_manifest` 检查（否则请求以 422
+    被拒绝），此处直接构建虚拟目录树并规划操作。
+    """
+    existing = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.existing, start=1)
+    ]
+    incoming = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.incoming, start=1)
+    ]
+    planned = plan_mirror_operations(existing, incoming)
+
+    operations = [
+        MirrorOperationOut(
+            step=step,
+            action=op.action,
+            type=OverlayEntryType(op.kind),
+            canonical_path=op.canonical_path,
+            comparison_key=op.comparison_key,
+            source=op.source,
+            index=op.index,
+        )
+        for step, op in enumerate(planned, start=1)
+    ]
+    counts = {action: 0 for action in MirrorAction}
+    for op in planned:
+        counts[op.action] += 1
+    summary = MirrorSummary(
+        total=len(operations),
+        delete=counts[MirrorAction.DELETE],
+        create_directory=counts[MirrorAction.CREATE_DIRECTORY],
+        keep_directory=counts[MirrorAction.KEEP_DIRECTORY],
+        create_file=counts[MirrorAction.CREATE_FILE],
+        overwrite_file=counts[MirrorAction.OVERWRITE_FILE],
+    )
+    return MirrorPreviewResponse(
+        target="windows", operations=operations, summary=summary
     )

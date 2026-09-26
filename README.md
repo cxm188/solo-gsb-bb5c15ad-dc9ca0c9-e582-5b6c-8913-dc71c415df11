@@ -9,7 +9,10 @@
 （单文件解压大小、整批解压总量、最大压缩比）；可选的 `selection_rules` 可在
 预检前按规范化后的归档路径 glob **筛选实际解包条目**（include/exclude）；
 另有**目标目录覆盖预演**接口：给定目标目录现存清单与按顺序解包的清单，
-在内存中的虚拟目录树上逐条干跑，预判每个条目将是新建、覆盖、目录复用还是被阻挡。
+在内存中的虚拟目录树上逐条干跑，预判每个条目将是新建、覆盖、目录复用还是被阻挡；
+以及**镜像同步预演**接口：给定现存清单与期望布局清单，
+在内存中规划把现存布局同步为期望布局的操作序列
+（删除 → 建目录 → 写文件），不访问文件系统。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -26,6 +29,9 @@ docker compose up --build
 - API 服务：<http://localhost:8000>
 - Swagger 文档：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
+- 预检接口：`POST http://localhost:8000/api/v1/preflight`
+- 覆盖预演：`POST http://localhost:8000/api/v1/overlay-preview`
+- 镜像同步预演：`POST http://localhost:8000/api/v1/mirror-preview`
 
 停止：`docker compose down`
 
@@ -172,6 +178,91 @@ curl 示例：
 curl -s http://localhost:8000/api/v1/overlay-preview \
   -H 'Content-Type: application/json' \
   -d '{"existing":[{"path":"docs/readme.txt","type":"file"}],"incoming":[{"path":"docs/readme.txt","type":"file"},{"path":"docs","type":"file"}]}'
+```
+
+### `POST /api/v1/mirror-preview`
+
+镜像同步预演：给定目标目录**现存清单**与**期望布局清单**，只在内存中生成
+把现存布局同步为期望布局的**操作序列**（不访问文件系统）。与覆盖预演不同，
+本接口假设目标是“让目录最终等于期望布局”：期望布局之外的现存内容会被规划删除，
+而不是保留。
+
+请求体：
+
+```json
+{
+  "existing": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "old/junk.bin", "type": "file" },
+    { "path": "swap", "type": "file" }
+  ],
+  "incoming": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "assets/logo.png", "type": "file" },
+    { "path": "swap", "type": "directory" }
+  ]
+}
+```
+
+- `existing`：目标目录现存的 `file` / `directory` 清单（可省略或为空，表示空目录）。
+  校验规则与覆盖预演一致：**含不安全路径、同键（Windows 比较键）重复、或文件占据
+  其他条目的祖先路径时整个请求返回 422**。
+- `incoming`：期望布局的 `file` / `directory` 清单（至少 1 条）。同样整体校验，
+  **含不安全路径、同键重复或文件祖先冲突时返回 422**（与覆盖预演不同，这里不安全
+  的期望条目不会被单独标记，而是整个请求被拒绝）。期望清单**未显式列出的父目录
+  视为需要保留的隐含目录**。
+- 两侧路径均复用与预检接口相同的 Windows 规范化规则（分隔符统一、NFC、段尾裁剪、
+  保留名/非法字符检查、词法遍历），比较键为 `casefold` 折叠后的规范路径。
+
+操作序列按三个阶段依次拼接（`operations` 即执行顺序，`step` 从 1 开始）：
+
+1. **`DELETE`**：删除期望布局外的现存节点（含未显式列出的现存隐含目录），
+   以及**类型互换处**（同键但文件/目录类型不同）的旧节点。按路径深度
+   **从深到浅**（先子后父），同深度按比较键排序。
+2. **`CREATE_DIRECTORY` / `KEEP_DIRECTORY`**：期望布局中的全部目录
+   （显式条目 + 隐含父目录），按深度**从浅到深**（先父后子），同深度按比较键
+   排序；现存已有同键目录的标记 `KEEP_DIRECTORY`（保留），否则
+   `CREATE_DIRECTORY`（创建）。
+3. **`CREATE_FILE` / `OVERWRITE_FILE`**：按 **incoming 顺序**写入期望清单中的
+   文件；同键已有现存文件标记 `OVERWRITE_FILE`（覆盖），否则 `CREATE_FILE`
+   （类型互换处的旧目录已在删除阶段移除，故新建）。
+
+响应中的每个操作：
+
+| 字段 | 说明 |
+| --- | --- |
+| `step` | 执行步序号（从 1 开始，按返回顺序依次执行） |
+| `action` | `DELETE` / `CREATE_DIRECTORY` / `KEEP_DIRECTORY` / `CREATE_FILE` / `OVERWRITE_FILE` |
+| `type` | 操作对象的节点类型：`file` 或 `directory` |
+| `canonical_path` | 规范路径（正斜杠分隔、NFC、段尾已裁剪） |
+| `comparison_key` | Windows 等价比较键（`casefold` 折叠） |
+| `source` | 节点来源：`DELETE` 步骤指向 `existing`（现存清单），其余步骤指向 `incoming`（期望清单）；未显式列出的隐含目录为 `implicit` |
+| `index` | 节点在来源清单中的下标（从 1 开始）；隐含目录为 `null` |
+| `summary` | `total / delete / create_directory / keep_directory / create_file / overwrite_file` 各操作数量 |
+
+curl 示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/mirror-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"existing":[{"path":"old/junk.bin","type":"file"},{"path":"docs/readme.txt","type":"file"}],"incoming":[{"path":"docs/readme.txt","type":"file"},{"path":"assets/logo.png","type":"file"}]}'
+```
+
+对应响应（节选）：
+
+```json
+{
+  "target": "windows",
+  "operations": [
+    { "step": 1, "action": "DELETE", "type": "file", "canonical_path": "old/junk.bin", "comparison_key": "old/junk.bin", "source": "existing", "index": 1 },
+    { "step": 2, "action": "DELETE", "type": "directory", "canonical_path": "old", "comparison_key": "old", "source": "implicit", "index": null },
+    { "step": 3, "action": "CREATE_DIRECTORY", "type": "directory", "canonical_path": "assets", "comparison_key": "assets", "source": "implicit", "index": null },
+    { "step": 4, "action": "KEEP_DIRECTORY", "type": "directory", "canonical_path": "docs", "comparison_key": "docs", "source": "implicit", "index": null },
+    { "step": 5, "action": "OVERWRITE_FILE", "type": "file", "canonical_path": "docs/readme.txt", "comparison_key": "docs/readme.txt", "source": "incoming", "index": 1 },
+    { "step": 6, "action": "CREATE_FILE", "type": "file", "canonical_path": "assets/logo.png", "comparison_key": "assets/logo.png", "source": "incoming", "index": 2 }
+  ],
+  "summary": { "total": 6, "delete": 2, "create_directory": 1, "keep_directory": 1, "create_file": 1, "overwrite_file": 1 }
+}
 ```
 
 ## 规范化规则（Windows 目标）
@@ -464,14 +555,15 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析与覆盖预演编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演与镜像同步预演编排
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
-│   ├── overlay.py       # 目标目录覆盖预演：现存清单校验、虚拟目录树与按序干跑（纯函数）
+│   ├── overlay.py       # 目标目录覆盖预演：清单校验、虚拟目录树与按序干跑（纯函数）
+│   ├── mirror.py        # 镜像同步预演：删除 → 建目录 → 写文件的操作序列规划（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务

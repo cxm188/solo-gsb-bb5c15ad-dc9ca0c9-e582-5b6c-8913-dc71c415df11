@@ -9,12 +9,14 @@ from fastapi import FastAPI
 
 from .schemas import (
     HealthResponse,
+    MirrorPreviewRequest,
+    MirrorPreviewResponse,
     OverlayPreviewRequest,
     OverlayPreviewResponse,
     PreflightRepairResponse,
     PreflightRequest,
 )
-from .service import run_overlay_preview, run_preflight
+from .service import run_mirror_preview, run_overlay_preview, run_preflight
 
 app = FastAPI(
     title="Archive Path Preflight API",
@@ -24,10 +26,12 @@ app = FastAPI(
         "链接链循环、符号链接祖先路径劫持）；可选的解压资源预算校验"
         "（单文件解压大小、整批解压总量、最大压缩比）；可选的 selection_rules"
         " 在预检前按规范化路径 glob 筛选实际解包条目；目标目录覆盖预演"
-        "（按现存清单与解包顺序干跑 CREATE/OVERWRITE/REUSE_DIRECTORY/BLOCKED）。"
-        "纯内存计算，不访问文件系统。"
+        "（按现存清单与解包顺序干跑 CREATE/OVERWRITE/REUSE_DIRECTORY/BLOCKED）；"
+        "镜像同步预演（规划把现存布局同步为期望布局的 "
+        "DELETE/CREATE_DIRECTORY/KEEP_DIRECTORY/CREATE_FILE/OVERWRITE_FILE "
+        "操作序列）。纯内存计算，不访问文件系统。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -44,6 +48,7 @@ def root() -> dict[str, str]:
         "health": "/health",
         "preflight": "POST /api/v1/preflight",
         "overlay_preview": "POST /api/v1/overlay-preview",
+        "mirror_preview": "POST /api/v1/mirror-preview",
     }
 
 
@@ -66,3 +71,13 @@ def preflight(request: PreflightRequest):
 )
 def overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewResponse:
     return run_overlay_preview(request)
+
+
+@app.post(
+    "/api/v1/mirror-preview",
+    response_model=MirrorPreviewResponse,
+    tags=["mirror"],
+    summary="镜像同步预演：规划把现存布局同步为期望布局的操作序列（纯内存）",
+)
+def mirror_preview(request: MirrorPreviewRequest) -> MirrorPreviewResponse:
+    return run_mirror_preview(request)
